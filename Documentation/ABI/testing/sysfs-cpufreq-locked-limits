@@ -1,0 +1,30 @@
+What:           /sys/devices/system/cpu/cpufreq/policyX/scaling_locked_limits
+Date:           September 2026
+Contact:        Tetris device maintainers
+Description:
+                Optional administrator ownership of a CPUFreq policy's software
+                bounds. Frequencies use kHz. Supported on table-based drivers
+                that use a target callback; other drivers return EOPNOTSUPP.
+
+                Read: "enabled minimum maximum". When enabled is 1 the pair is
+                the locked range; when 0 it is the current effective range.
+                Write "1 minimum maximum" to atomically validate and apply a
+                locked range. Both frequencies must be currently supported OPPs,
+                minimum must not exceed maximum, and driver verification must
+                preserve the pair. Invalid input changes nothing. Failed driver
+                application attempts to restore the preceding lock state.
+                Write "0" to release ownership and immediately apply the latest
+                normal frequency-QoS aggregate. No profile is saved across reboot.
+
+                Ordinary scaling_min_freq/scaling_max_freq writes and frequency
+                QoS requests continue to update the normal requests while locked,
+                but cannot change the effective policy bounds. That includes CPU
+                cooling requests using frequency QoS. This interface does not
+                modify the OPP table, overclock, suppress emergency shutdown, or
+                disable hardware/firmware constraints. A selected bound does not
+                promise an actual clock frequency under every hardware condition.
+
+                Policy rwsem serializes sysfs operations, hotplug and policy
+                refresh. Driver removal/recreation clears the lock. Ownership
+                state is private to CPUFreq and does not alter the exported
+                struct cpufreq_policy ABI.

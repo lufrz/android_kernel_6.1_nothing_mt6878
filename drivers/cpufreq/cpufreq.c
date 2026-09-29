@@ -36,6 +36,27 @@
 
 static LIST_HEAD(cpufreq_policy_list);
 
+/*
+ * Private allocation tail: do not change struct cpufreq_policy's exported KMI.
+ * Every policy is allocated by cpufreq_policy_alloc(). Access to locked_limits
+ * follows the same policy->rwsem rules as access to policy->min/max.
+ */
+struct cpufreq_locked_limits {
+	bool enabled;
+	unsigned int min;
+	unsigned int max;
+};
+
+struct cpufreq_policy_private {
+	struct cpufreq_policy policy;
+	struct cpufreq_locked_limits locked_limits;
+};
+
+static struct cpufreq_policy_private *cpufreq_policy_private(struct cpufreq_policy *policy)
+{
+	return container_of(policy, struct cpufreq_policy_private, policy);
+}
+
 #define MIN_LIMIT_STORE_COUNT 3
 
 struct cpumask_uint_kv {
@@ -805,6 +826,112 @@ store_one(scaling_min_freq, min);
 store_one(scaling_max_freq, max);
 
 /*
+ * Atomic administrator-owned limits. Ordinary QoS requests remain recorded so
+ * unlocking immediately restores the latest aggregate instead of stale limits.
+ * These limits do not change the OPP table or hardware/firmware safeguards.
+ */
+static ssize_t show_scaling_locked_limits(struct cpufreq_policy *policy, char *buf)
+{
+	struct cpufreq_locked_limits *limits =
+		&cpufreq_policy_private(policy)->locked_limits;
+
+	if (!has_target() || !policy->freq_table)
+		return -EOPNOTSUPP;
+
+	return sysfs_emit(buf, "%u %u %u\n", limits->enabled,
+			  limits->enabled ? limits->min : policy->min,
+			  limits->enabled ? limits->max : policy->max);
+}
+
+static bool cpufreq_lock_frequency_valid(struct cpufreq_policy *policy,
+					unsigned int frequency)
+{
+	struct cpufreq_frequency_table *entry;
+
+	if (frequency < policy->cpuinfo.min_freq ||
+	    frequency > policy->cpuinfo.max_freq)
+		return false;
+
+	cpufreq_for_each_valid_entry(entry, policy->freq_table) {
+		if (entry->frequency == frequency &&
+		    (!(entry->flags & CPUFREQ_BOOST_FREQ) || cpufreq_boost_enabled()))
+			return true;
+	}
+	return false;
+}
+
+static int cpufreq_parse_locked_limits(const char *buf,
+				      struct cpufreq_locked_limits *limits)
+{
+	unsigned int values[3];
+	char *input, *cursor, *token;
+	int count = 0;
+	int ret = -EINVAL;
+
+	input = kstrdup(buf, GFP_KERNEL);
+	if (!input)
+		return -ENOMEM;
+	cursor = input;
+	while ((token = strsep(&cursor, " \t\n"))) {
+		if (!*token)
+			continue;
+		if (count == ARRAY_SIZE(values) || kstrtouint(token, 10, &values[count]))
+			goto out;
+		count++;
+	}
+	if (count == 1 && values[0] == 0) {
+		*limits = (struct cpufreq_locked_limits) { 0 };
+		ret = 0;
+	} else if (count == 3 && values[0] == 1 && values[1] &&
+		   values[1] <= values[2]) {
+		limits->enabled = true;
+		limits->min = values[1];
+		limits->max = values[2];
+		ret = 0;
+	}
+out:
+	kfree(input);
+	return ret;
+}
+
+static ssize_t store_scaling_locked_limits(struct cpufreq_policy *policy,
+					  const char *buf, size_t count)
+{
+	struct cpufreq_locked_limits *limits =
+		&cpufreq_policy_private(policy)->locked_limits;
+	struct cpufreq_locked_limits previous = *limits;
+	struct cpufreq_locked_limits requested;
+	int ret, restore_ret;
+
+	if (!has_target() || !policy->freq_table)
+		return -EOPNOTSUPP;
+
+	ret = cpufreq_parse_locked_limits(buf, &requested);
+	if (ret)
+		return ret;
+	if (requested.enabled &&
+	    (!cpufreq_lock_frequency_valid(policy, requested.min) ||
+	     !cpufreq_lock_frequency_valid(policy, requested.max)))
+		return -EINVAL;
+
+	/* store() holds the policy write semaphore across this entire transaction. */
+	*limits = requested;
+	ret = cpufreq_set_policy(policy, policy->governor, policy->policy);
+	if (!ret && requested.enabled &&
+	    (policy->min != requested.min || policy->max != requested.max))
+		ret = -ERANGE;
+	if (!ret)
+		return count;
+
+	*limits = previous;
+	restore_ret = cpufreq_set_policy(policy, policy->governor, policy->policy);
+	if (restore_ret)
+		pr_err("CPU%u: failed to restore locked limits: %d\n",
+		       policy->cpu, restore_ret);
+	return ret;
+}
+
+/*
  * show_cpuinfo_cur_freq - current CPU frequency as detected by hardware
  */
 static ssize_t show_cpuinfo_cur_freq(struct cpufreq_policy *policy,
@@ -993,6 +1120,7 @@ cpufreq_freq_attr_ro(affected_cpus);
 cpufreq_freq_attr_rw(scaling_min_freq);
 cpufreq_freq_attr_rw(scaling_min_freq_limit);
 cpufreq_freq_attr_rw(scaling_max_freq);
+cpufreq_freq_attr_rw(scaling_locked_limits);
 cpufreq_freq_attr_rw(scaling_governor);
 cpufreq_freq_attr_rw(scaling_setspeed);
 
@@ -1003,6 +1131,7 @@ static struct attribute *cpufreq_attrs[] = {
 	&scaling_min_freq.attr,
 	&scaling_min_freq_limit.attr,
 	&scaling_max_freq.attr,
+	&scaling_locked_limits.attr,
 	&affected_cpus.attr,
 	&related_cpus.attr,
 	&scaling_governor.attr,
@@ -1257,6 +1386,7 @@ static void cpufreq_policy_put_kobj(struct cpufreq_policy *policy)
 
 static struct cpufreq_policy *cpufreq_policy_alloc(unsigned int cpu)
 {
+	struct cpufreq_policy_private *private;
 	struct cpufreq_policy *policy;
 	struct device *dev = get_cpu_device(cpu);
 	int ret;
@@ -1264,9 +1394,10 @@ static struct cpufreq_policy *cpufreq_policy_alloc(unsigned int cpu)
 	if (!dev)
 		return NULL;
 
-	policy = kzalloc(sizeof(*policy), GFP_KERNEL);
-	if (!policy)
+	private = kzalloc(sizeof(*private), GFP_KERNEL);
+	if (!private)
 		return NULL;
+	policy = &private->policy;
 
 	if (!alloc_cpumask_var(&policy->cpus, GFP_KERNEL))
 		goto err_free_policy;
@@ -1334,7 +1465,7 @@ err_free_rcpumask:
 err_free_cpumask:
 	free_cpumask_var(policy->cpus);
 err_free_policy:
-	kfree(policy);
+	kfree(cpufreq_policy_private(policy));
 
 	return NULL;
 }
@@ -1385,7 +1516,7 @@ static void cpufreq_policy_free(struct cpufreq_policy *policy)
 	free_cpumask_var(policy->real_cpus);
 	free_cpumask_var(policy->related_cpus);
 	free_cpumask_var(policy->cpus);
-	kfree(policy);
+	kfree(cpufreq_policy_private(policy));
 }
 
 static int cpufreq_online(unsigned int cpu)
@@ -2641,6 +2772,16 @@ static int cpufreq_set_policy(struct cpufreq_policy *policy,
 	new_data.max = freq_qos_read_value(&policy->constraints, FREQ_QOS_MAX);
 
 	new_data.min = min(new_data.min, get_cpumask_min_limit(policy->related_cpus));
+
+	/*
+	 * An explicit lock owns the software policy bounds, including over thermal
+	 * QoS clients. Hardware/firmware protection and driver verification still
+	 * apply. Queued QoS changes take effect as soon as the lock is released.
+	 */
+	if (cpufreq_policy_private(policy)->locked_limits.enabled) {
+		new_data.min = cpufreq_policy_private(policy)->locked_limits.min;
+		new_data.max = cpufreq_policy_private(policy)->locked_limits.max;
+	}
 
 	pr_debug("setting new policy for CPU %u: %u - %u kHz\n",
 		 new_data.cpu, new_data.min, new_data.max);
